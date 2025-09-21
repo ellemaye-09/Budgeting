@@ -1,237 +1,206 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 from datetime import date, timedelta
-import uuid
+import calendar
 
-# ------------------ Helpers ------------------
-
-FREQ_MAP = {
-    "Once": ("once", 1),
-    "Daily": ("days", 1),
-    "Weekly": ("weeks", 1),
-    "Fortnightly": ("weeks", 2),
-    "4-weekly": ("weeks", 4),
-    "Monthly": ("months", 1),
-    "Quarterly": ("months", 3),
-    "6-monthly": ("months", 6),
-    "Annually": ("years", 1),
-}
-
-def freq_label_from_unit_interval(unit, interval):
-    for label, (u, i) in FREQ_MAP.items():
-        if u == unit and int(i) == int(interval):
-            return label
-    return f"{unit} x{interval}"
+# --------------------------
+# Utility functions
+# --------------------------
 
 def safe_date_parse(d):
-    if d is None or d == "":
+    if not d:
         return None
     if isinstance(d, date):
         return d
     try:
         return pd.to_datetime(d).date()
-    except:
+    except Exception:
         return None
 
-def normalize_amount(a):
+def normalize_amount(val):
     try:
-        return float(a)
-    except:
+        return float(val)
+    except Exception:
         return None
 
-def shift_to_business_day(d):
-    while d.weekday() >= 5:  # Sat=5, Sun=6
-        d = d + timedelta(days=1)
-    return d
-
-def generate_occurrences(item):
+def generate_occurrences(item, horizon_days=365):
+    """Generate all occurrences for one item, based on chosen frequency."""
     occurrences = []
     amt = normalize_amount(item.get("amount"))
     if amt is None:
         return occurrences
-    amt = -abs(amt) if item.get("direction") == "expense" else abs(amt)
+
+    amt = -abs(amt) if item.get("direction", "expense") == "expense" else abs(amt)
 
     start = safe_date_parse(item.get("start_date"))
-    if start is None:
+    if not start:
         return occurrences
 
-    end = safe_date_parse(item.get("end_date"))
-    unit = item.get("freq_unit", "once")
-    interval = int(item.get("interval", 1))
-
-    if unit == "once":
-        occurrences.append((shift_to_business_day(start), amt, item.get("account")))
-        return occurrences
+    end = safe_date_parse(item.get("end_date")) or (date.today() + timedelta(days=horizon_days))
+    freq = item.get("frequency", "once")
 
     current = start
-    max_iter = 5000
-    it = 0
+    while current <= end:
+        occurrences.append((current, amt))
 
-    while it < max_iter:
-        current_shifted = shift_to_business_day(current)
-        occurrences.append((current_shifted, amt, item.get("account")))
-
-        if unit == "days":
-            current = current + timedelta(days=interval)
-        elif unit == "weeks":
-            current = current + timedelta(weeks=interval)
-        elif unit == "months":
-            nd = pd.date_range(start=current, periods=2, freq=f"{interval}M")[1].date()
-            current = nd
-        elif unit == "years":
-            nd = pd.date_range(start=current, periods=2, freq=f"{interval}Y")[1].date()
-            current = nd
-        else:
-            break
-
-        it += 1
-        if end and current > end:
+        if freq == "daily":
+            current += timedelta(days=1)
+        elif freq == "weekly":
+            current += timedelta(weeks=1)
+        elif freq == "fortnightly":
+            current += timedelta(weeks=2)
+        elif freq == "4-weekly":
+            current += timedelta(weeks=4)
+        elif freq == "monthly":
+            month = current.month + 1
+            year = current.year
+            if month > 12:
+                month = 1
+                year += 1
+            day = min(current.day, calendar.monthrange(year, month)[1])
+            current = date(year, month, day)
+        elif freq == "quarterly":
+            month = current.month + 3
+            year = current.year
+            if month > 12:
+                month -= 12
+                year += 1
+            day = min(current.day, calendar.monthrange(year, month)[1])
+            current = date(year, month, day)
+        elif freq == "6-monthly":
+            month = current.month + 6
+            year = current.year
+            if month > 12:
+                month -= 12
+                year += 1
+            day = min(current.day, calendar.monthrange(year, month)[1])
+            current = date(year, month, day)
+        elif freq == "annually":
+            try:
+                current = date(current.year + 1, current.month, current.day)
+            except:
+                current = date(current.year + 1, current.month, 28)
+        else:  # once
             break
 
     return occurrences
 
-def build_forecast(items, accounts, start_date, days, threshold):
-    if not accounts:
-        return None, pd.DataFrame()
 
-    all_dates = pd.date_range(start=start_date, periods=days).date
-    balances = {a["id"]: [a["opening"]] * days for a in accounts}
-    account_names = {a["id"]: a["name"] for a in accounts}
+def build_forecast(items, accounts, days=365, min_balance=0):
+    """Build a day-by-day forecast for all accounts."""
+    today = date.today()
+    horizon = today + timedelta(days=days)
+    all_dates = pd.date_range(today, horizon)
 
-    # Collect occurrences
-    events = []
-    for it in items:
-        for d, amt, acc in generate_occurrences(it):
-            if start_date <= d <= all_dates[-1]:
-                events.append((d, amt, acc))
+    balances = pd.DataFrame(index=all_dates, columns=accounts.keys())
+    balances = balances.fillna(0.0)
 
-    events.sort(key=lambda x: x[0])
+    # Initialise with opening balances
+    for acc, opening in accounts.items():
+        balances.loc[:, acc] = opening
 
-    for i, d in enumerate(all_dates):
-        if i > 0:
-            for acc in balances:
-                balances[acc][i] = balances[acc][i - 1]
-        for ev in [e for e in events if e[0] == d]:
-            balances[ev[2]][i] += ev[1]
+    # Apply each item to forecast
+    for item in items:
+        acc = item.get("account")
+        if acc not in accounts:
+            continue
+        occurrences = generate_occurrences(item, horizon_days=days)
+        for d, amt in occurrences:
+            if d in balances.index:
+                balances.loc[d:, acc] += amt  # apply forward
 
-    df = pd.DataFrame({"date": all_dates})
-    for acc in balances:
-        df[account_names[acc]] = balances[acc]
-    df["Total"] = df.drop(columns="date").sum(axis=1)
+    # Flag low balance
+    flags = (balances < min_balance)
 
-    low_flag = (df["Total"] < threshold).any()
+    return balances, flags
 
-    return df, events, low_flag
 
-# ------------------ Session state ------------------
+def calendar_heatmap(balances, account):
+    """Return a calendar heatmap dataframe for one account."""
+    df = balances[[account]].copy()
+    df["date"] = df.index.date
+    df["year"] = df.index.year
+    df["month"] = df.index.month
+    df["day"] = df.index.day
 
+    pivot = df.pivot_table(index=["year", "month"], columns="day", values=account, aggfunc="last")
+    return pivot
+
+
+# --------------------------
+# Streamlit App
+# --------------------------
+
+st.set_page_config(page_title="Money Forecast", layout="wide")
+
+st.title("📊 Money Tracker & Forecast")
+
+# Session state init
 if "items" not in st.session_state:
     st.session_state["items"] = []
-
 if "accounts" not in st.session_state:
-    st.session_state["accounts"] = []
+    st.session_state["accounts"] = {}
 
-# ------------------ UI ------------------
+# Sidebar for account management
+st.sidebar.header("Accounts")
+with st.sidebar:
+    acc_name = st.text_input("Add account name")
+    acc_opening = st.number_input("Opening balance", value=0.0, step=100.0)
+    if st.button("➕ Add account"):
+        if acc_name and acc_name not in st.session_state["accounts"]:
+            st.session_state["accounts"][acc_name] = acc_opening
 
-st.title("💰 Money Tracker & Forecast")
-
-# ---- Account Management ----
-st.header("Accounts")
-col1, col2 = st.columns(2)
-with col1:
-    acc_name = st.text_input("Account name", key="acc_name")
-    opening = st.number_input("Opening balance", value=0.0, step=100.0, key="acc_opening")
-    if st.button("➕ Add Account"):
-        if acc_name:
-            st.session_state["accounts"].append({"id": str(uuid.uuid4()), "name": acc_name, "opening": opening})
-            st.success(f"Added account: {acc_name}")
-            st.experimental_rerun()
-with col2:
     if st.session_state["accounts"]:
-        to_remove = st.selectbox("Remove account", options=[a["name"] for a in st.session_state["accounts"]])
-        if st.button("🗑️ Remove"):
-            st.session_state["accounts"] = [a for a in st.session_state["accounts"] if a["name"] != to_remove]
-            st.success(f"Removed account: {to_remove}")
-            st.experimental_rerun()
+        del_acc = st.selectbox("Remove account", options=[""] + list(st.session_state["accounts"].keys()))
+        if st.button("🗑️ Remove selected account") and del_acc:
+            st.session_state["accounts"].pop(del_acc, None)
 
-if st.session_state["accounts"]:
-    st.table(pd.DataFrame(st.session_state["accounts"])[["name", "opening"]])
-else:
-    st.info("No accounts yet. Add at least one.")
+st.write("### Current Accounts")
+st.write(st.session_state["accounts"])
 
-# ---- Planned Items ----
-st.header("Planned Income & Expenses")
-with st.form("item_form", clear_on_submit=True):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        name = st.text_input("Name")
-        direction = st.selectbox("Type", ["income", "expense"])
-        amt_val = st.number_input("Amount", step=10.0)
-    with c2:
-        freq_label = st.selectbox("Frequency", list(FREQ_MAP.keys()))
-        start_date = st.date_input("Start date", value=date.today())
-        end_date = st.date_input("End date (optional)", value=None)
-    with c3:
-        if st.session_state["accounts"]:
-            acc_choice = st.selectbox("Account", [a["name"] for a in st.session_state["accounts"]])
-        else:
-            acc_choice = None
-        notes = st.text_area("Notes")
-
+# Add income/expense items
+st.header("Add Planned Item")
+with st.form("add_item"):
+    name = st.text_input("Name")
+    direction = st.selectbox("Type", ["income", "expense"])
+    amount = st.number_input("Amount", value=0.0, step=10.0)
+    frequency = st.selectbox("Frequency", ["once", "daily", "weekly", "fortnightly", "4-weekly", "monthly", "quarterly", "6-monthly", "annually"])
+    start_date = st.date_input("Start date", value=date.today())
+    end_date = st.date_input("End date (optional)", value=None)
+    account = st.selectbox("Account", options=list(st.session_state["accounts"].keys()) if st.session_state["accounts"] else [])
+    notes = st.text_area("Notes", "")
     submitted = st.form_submit_button("Add Item")
-    if submitted:
-        if not acc_choice:
-            st.error("Add an account first.")
-        else:
-            unit, interval = FREQ_MAP[freq_label]
-            acc_id = next(a["id"] for a in st.session_state["accounts"] if a["name"] == acc_choice)
-            st.session_state["items"].append({
-                "name": name,
-                "direction": direction,
-                "amount": amt_val,
-                "freq_unit": unit,
-                "interval": interval,
-                "frequency_label": freq_label,
-                "start_date": start_date,
-                "end_date": end_date,
-                "notes": notes,
-                "account": acc_id,
-            })
-            st.success("Item added!")
+    if submitted and account:
+        st.session_state["items"].append({
+            "name": name,
+            "direction": direction,
+            "amount": amount,
+            "frequency": frequency,
+            "start_date": start_date,
+            "end_date": end_date,
+            "account": account,
+            "notes": notes
+        })
+        st.success(f"Added {direction}: {name} to {account}")
 
-if st.session_state["items"]:
-    st.dataframe(pd.DataFrame(st.session_state["items"])[
-        ["name","direction","amount","frequency_label","account","start_date","end_date","notes"]
-    ])
-
-# ---- Forecast ----
+# Forecast
 st.header("Forecast")
-forecast_days = 365
-threshold = st.number_input("Balance alert threshold", value=0.0, step=100.0)
+min_balance = st.number_input("Minimum balance warning threshold", value=0.0, step=100.0)
+days = st.slider("Forecast horizon (days)", 30, 730, 365)
 
 if st.button("Generate Forecast"):
-    df, events, low_flag = build_forecast(st.session_state["items"], st.session_state["accounts"], date.today(), forecast_days, threshold)
-
-    if df is not None and not df.empty:
-        st.subheader("Daily Balances")
-        st.dataframe(df)
-
-        # Calendar heat map (total balance)
-        df_heat = df.copy()
-        df_heat["month"] = pd.to_datetime(df_heat["date"]).dt.to_period("M").astype(str)
-        fig = px.density_heatmap(df_heat, x="date", y="month", z="Total", color_continuous_scale="RdYlGn",
-                                 title="Balance Heatmap (Total)")
-        st.plotly_chart(fig, use_container_width=True)
-
-        if low_flag:
-            st.error("⚠️ Forecast dips below threshold!")
-        else:
-            st.success("✅ Balance stays above threshold.")
+    if not st.session_state["accounts"]:
+        st.error("Please add at least one account.")
     else:
-        st.error("Forecast generation failed. Add accounts and items first.")
+        balances, flags = build_forecast(st.session_state["items"], st.session_state["accounts"], days=days, min_balance=min_balance)
+        st.success("Forecast generated!")
 
-# ---- Google Sheets Integration (placeholder) ----
-st.header("Export / Backup")
-if st.button("Export to Google Sheets"):
-    st.info("Google Sheets export not configured. Add service account JSON + gspread setup.")
+        st.subheader("Balances")
+        st.dataframe(balances.style.applymap(lambda v: "background-color: pink" if v < min_balance else ""))
+
+        # Calendar-style heatmaps
+        st.subheader("Calendar Heatmaps")
+        for acc in st.session_state["accounts"].keys():
+            st.markdown(f"**{acc}**")
+            pivot = calendar_heatmap(balances, acc)
+            st.dataframe(pivot.style.background_gradient(cmap="RdYlGn"))
