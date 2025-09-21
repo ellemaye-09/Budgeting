@@ -1,0 +1,5 @@
+Name,Type,Amount,Start Date,Frequency,Notes
+Salary,Income,2000,2025-10-01,Fortnightly,Work salary
+Mortgage,Expense,1650,2025-10-02,Fortnightly,House 2 mortgage
+Food,Expense,150,2025-10-03,Weekly,Groceries
+Utilities,Expense,300,2025-10-05,Monthly,"Power, internet"
